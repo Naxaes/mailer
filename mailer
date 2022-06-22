@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+import yaml
+from cryptography.fernet import Fernet
+
+from pathlib import Path
+import argparse
+import os
+import getpass
+import smtplib
+import imaplib
+import ssl
+import email
+from email.header import decode_header
+from email.message import EmailMessage
+from email.headerregistry import Address
+from email.utils import make_msgid
+
+SETTINGS_FOLDER     = Path.home() / '.mailer'
+PRIVATE_KEY_FILE    = SETTINGS_FOLDER / '.key'
+LOGGED_IN_USER_FILE = SETTINGS_FOLDER / '.users'
+
+
+def fetch_private_key():
+    try:
+        with open(PRIVATE_KEY_FILE, 'rb') as file:
+            key = file.read()
+        return key
+    except FileNotFoundError:
+        os.makedirs(SETTINGS_FOLDER, exist_ok=True)
+        key = Fernet.generate_key()
+        with open(PRIVATE_KEY_FILE, 'wb') as file:
+            file.write(key)
+        return key
+
+
+def decode_payload(mail):
+    content_type = mail.get_content_type()
+    payload = mail.get_payload(decode=True)
+    if payload is None:
+        return ''
+
+    try:
+        # Try delegating to built-in decoding.
+        return payload.decode()
+    except UnicodeDecodeError as e:
+        # If it's html, get the charset encoding.
+        if content_type == 'text/html':
+            charset_index_start = payload.find(b'charset=') + len(b'charset=')
+            charset_index_stop = charset_index_start
+            while payload[charset_index_stop] in b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-':
+                charset_index_stop += 1
+            charset = payload[charset_index_start:charset_index_stop].decode("utf-8")
+            return payload.decode(charset)
+        else:
+            return ''
+
+
+def load_default_configuration():
+    with open('configuration.yml', 'r') as configuration_file:
+        configuration = yaml.safe_load(configuration_file)
+    return configuration
+
+
+def ask_which_server(configuration):
+    choices = configuration.keys()
+    while True:
+        prompt = '* ' + '\n*'.join(choices) + '\n * Press q to go back.'
+        choice = input(prompt).lower()
+        if choice in choices or choice == 'q':
+            return choice
+        else:
+            print('Select a valid choice')
+
+
+def login(user: str, server):
+    password = load_password(user)
+    if not password:
+        while True:
+            password = getpass.getpass()
+            try:
+                server.login(user, password)
+                store_password(user, password)
+                break
+            except imaplib.IMAP4.error:
+                if input('Invalid password. Try again? (Y/n): ') == 'n':
+                    return
+    else:
+        server.login(user, password)
+
+
+def send_mail(sender, receiver, subject, content, cc, user, host, port):
+    mail = EmailMessage()
+    mail['Subject'] = subject
+    mail['From']    = sender
+    mail['To']      = receiver
+    mail['Date']    = email.utils.formatdate()
+
+    if cc:
+        mail['CC'] = cc
+
+    mail.set_content(content)
+
+    # https://sendgrid.com/blog/embedding-images-emails-facts/
+    # asparagus_cid = make_msgid()
+    # mail.add_alternative(f"""\
+    # <html>
+    #   <head></head>
+    #   <body>
+    #     <p>Hi!</p>
+    #     <p>Testing <a href="http://www.google.com/">Link</a> här.</p>
+    #     <img src="cid:{asparagus_cid[1:-1]}" />
+    #   </body>
+    # </html>
+    # """, subtype='html')
+    # Now add the related image to the html part.
+    # with open("image.jpg", 'rb') as img:
+    #     payload = msg.get_payload()
+    #     payload[1].add_related(img.read(), 'image', 'jpeg', cid=asparagus_cid)
+
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(host, port) as s:
+        s.set_debuglevel(2)
+        s.starttls(context=context)
+        s.ehlo()
+        login(user, s)
+        s.send_message(mail)
+
+
+def fetch_mail(host: str, port: int, user: str, count: int = 1):
+    context = ssl.create_default_context()
+    with imaplib.IMAP4_SSL(host, port, ssl_context=context) as m:
+        login(user, m)
+
+        status, messages = m.select("INBOX")
+        messages = int(messages[0])
+        if count > messages:
+            count = messages
+
+        for i in range(messages, messages-count, -1):
+            status, message = m.fetch(str(i), "(RFC822)")
+            mail = email.message_from_bytes(message[0][1])
+
+            subject, encoding = decode_header(mail["Subject"])[0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(encoding)
+
+            sender, encoding = decode_header(mail.get("From"))[0]
+            if isinstance(sender, bytes):
+                sender = sender.decode(encoding)
+
+            print("Subject:", sender)
+            print("From:", subject)
+
+            if mail.is_multipart():
+                for part in mail.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+                    body = decode_payload(part)
+                    if content_type == "text/plain" and "attachment" not in content_disposition:
+                        print(body)
+                    elif "attachment" in content_disposition:
+                        filename = part.get_filename()
+                        # body = decode_payload(part)
+                        print(filename)
+            else:
+                content_type = mail.get_content_type()
+                body = decode_payload(mail)
+
+                if content_type == "text/plain":
+                    print(body)
+                elif content_type == "text/html":
+                    print(body)
+
+            print("=" * 100)
+
+    m.close()
+
+
+def create_input_parser(configuration):
+    servers = tuple(configuration.keys())
+
+    parser = argparse.ArgumentParser(description='Send and receive mails')
+    parser.add_argument('--server', type=str, choices=servers, default=servers[0])
+
+    subparsers = parser.add_subparsers(title='commands', dest='command')
+
+    parser_send = subparsers.add_parser('send')
+    parser_send.add_argument('-s', '--subject', type=str, required=True, help='title of the mail')
+    parser_send.add_argument('-c', '--content', type=str, required=True, help="text included in the body of the mail")
+    parser_send.add_argument('-t', '--to',      type=str, required=True, help="to whom to send the mail")
+    parser_send.add_argument('-m', '--sender',  type=str, help="who the mail is sent from")
+    parser_send.add_argument('-d', '--date',    type=str, help="date to attach to the mail")
+    parser_send.add_argument('-x', '--cc',      type=str, help="to whom to send copies of the mail")
+
+    file_send = subparsers.add_parser('send-file')
+    file_send.add_argument('-f', '--file',    type=str, required=True, help='file to send')
+    file_send.add_argument('-s', '--subject', type=str, help='title of the mail')
+    file_send.add_argument('-d', '--date',    type=str, help="date to attach to the mail")
+    file_send.add_argument('-c', '--content', type=str, help="text included in the body of the mail")
+    file_send.add_argument('-m', '--sender',  type=str, help="who the mail is sent from")
+    file_send.add_argument('-t', '--to',      type=str, help="to whom to send the mail")
+    file_send.add_argument('-x', '--cc',      type=str, help="to whom to send copies of the mail")
+
+    parser_fetch = subparsers.add_parser('fetch')
+    parser_fetch.add_argument('count',   type=int, nargs='?', default=1, help='number of mails to fetch')
+    parser_fetch.add_argument('mailbox', type=str, nargs='?', default='INBOX', help='mailbox to get from')
+
+    return parser
+
+
+def load_password(user: str):
+    try:
+        with open(LOGGED_IN_USER_FILE, 'rb') as file:
+            lines = [line.replace(b'\n', b'') for line in file.readlines()]
+    except FileNotFoundError:
+        return ''
+
+    private_key = fetch_private_key()
+    for info in lines:
+        name, password = info.split(b'|')
+        fernet = Fernet(private_key)
+        user_name = fernet.decrypt(name).decode()
+        if user_name == user:
+            password = fernet.decrypt(password).decode()
+            return password
+    return ''
+
+
+def store_password(user: str, password: str):
+    private_key = fetch_private_key()
+    fernet = Fernet(private_key)
+
+    hashed_password = fernet.encrypt(password.encode())
+    hashed_user     = fernet.encrypt(user.encode())
+
+    with open(LOGGED_IN_USER_FILE, 'a+b') as file:
+        file.write(hashed_user + b'|' + hashed_password + b'\n')
+
+
+def parse_send_file(args):
+    with open(args.file, 'r') as file:
+        content = file.readlines()
+
+    for i in range(6):
+        if content[i].startswith('From: ') and not hasattr(args, 'From'):
+            args.sender = content[i][len('From: '):].strip()
+        elif content[i].startswith('To: ') and not hasattr(args, 'To'):
+            args.to = content[i][len('To: '):].strip()
+        elif content[i].startswith('Cc: ') and not hasattr(args, 'Cc'):
+            args.cc = content[i][len('Cc: '):].strip()
+        elif content[i].startswith('Date: ') and not hasattr(args, 'Date'):
+            args.date = content[i][len('Date: '):].strip()
+        elif content[i].startswith('Subject: ') and not hasattr(args, 'Subject'):
+            args.subject = content[i][len('Subject: '):].strip()
+        else:
+            args.content = ''.join(content[i:]).strip()
+            break
+
+    return args
+
+
+def main():
+    configuration = load_default_configuration()
+    parser = create_input_parser(configuration)
+    args   = parser.parse_args()
+
+    if args.command == 'send':
+        sender   = Address(configuration[args.server]['name'], configuration[args.server]['user'], configuration[args.server]['domain'])
+        receiver = args.to
+        subject  = args.subject
+        content  = args.content
+        cc       = args.cc
+        host     = configuration[args.server]['outgoing']['host']
+        port     = configuration[args.server]['outgoing']['port']
+        user     = configuration[args.server]['user']
+        send_mail(sender, receiver, subject, content, cc, user, host, port)
+    elif args.command == 'send-file':
+        args     = parse_send_file(args)
+        sender   = getattr(args, 'sender', Address(configuration[args.server]['name'], configuration[args.server]['user'], configuration[args.server]['domain']))
+        receiver = args.to
+        subject  = args.subject
+        content  = args.content
+        cc       = args.cc
+        host     = configuration[args.server]['outgoing']['host']
+        port     = configuration[args.server]['outgoing']['port']
+        user     = configuration[args.server]['user']
+        send_mail(sender, receiver, subject, content, cc, user, host, port)
+    elif args.command == 'fetch':
+        host = configuration[args.server]['ingoing']['host']
+        port = configuration[args.server]['ingoing']['port']
+        user = configuration[args.server]['user']
+        fetch_mail(host, port, user, args.count)
+    else:
+        parser.print_help()
+
+
+
+if __name__ == '__main__':
+    main()
+

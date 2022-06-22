@@ -1,0 +1,6 @@
+From: "Bob Example" <bob.example@hotmail.com>
+To: "Alice Example" <alice.example@hotmail.com>
+Subject: Test message
+Cc: boss@hotmail.com
+
+Hello! This is a test
